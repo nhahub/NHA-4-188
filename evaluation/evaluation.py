@@ -1,10 +1,7 @@
 # evaluation/evaluation.py
 import os
-import sys
 import json
-import numpy as np
-import torch
-from PIL import Image
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 import mlflow
@@ -16,39 +13,76 @@ from sklearn.metrics import (
     confusion_matrix
 )
 
-# Make src/ importable (config.py, model.py, transforms.py live there)
-SRC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
-sys.path.append(SRC_DIR)
+import sys
+sys.path.append(r"C:\Users\jessi\Downloads\skin_project\fusion\fusion")
 
 import config
-from model import SkinLesionClassifier
-from transforms import test_transform
+from predict import FusionPredictor
 
-# Define Class Labels (must match config.CLASS_NAMES / ImageFolder order)
+# ─── Paths ───
+VAL_CSV_PATH = r"C:\Users\jessi\Downloads\skin_project\fusion\fusion\real_val.csv"
+DATA_ROOT = r"C:\Users\jessi\Downloads\skin_project\data"                 
+
 CLASS_NAMES = config.CLASS_NAMES
 
-# Calculate Classification Metrics
+
+def resolve_image_path(colab_path):
+    """
+   
+   
+    """
+    parts = colab_path.replace("\\", "/").split("/")
+    
+    folder_name, file_name = parts[-2], parts[-1]
+    return os.path.join(DATA_ROOT, folder_name, file_name)
+
+
+def run_predictions(val_df, predictor):
+    y_true, y_pred = [], []
+    skipped = 0
+    total = len(val_df)
+
+    for i, (_, row) in enumerate(val_df.iterrows(), start=1):
+        image_path = resolve_image_path(row["image_path"])
+        symptom_text = row["text"]
+        true_label = row["condition"]
+
+        if not os.path.exists(image_path):
+            print(f"[{i}/{total}] صورة مفقودة: {image_path}")
+            skipped += 1
+            continue
+
+        try:
+            result = predictor.predict(image_path, symptom_text)
+            y_true.append(true_label)
+            y_pred.append(result["condition"])
+            print(f"[{i}/{total}] OK -> true={true_label} | pred={result['condition']}")
+        except Exception as e:
+            print(f"[{i}/{total}]  failure {image_path}: {e}")
+            skipped += 1
+
+    if skipped:
+        print(f"\n تم تخطي {skipped} صف بسبب صور مفقودة أو أخطاء.")
+
+    return y_true, y_pred
+
+
 def compute_metrics(y_true, y_pred):
-    metrics = {
+    return {
         "accuracy":  round(accuracy_score(y_true, y_pred), 4),
         "precision": round(precision_score(y_true, y_pred, average='weighted', zero_division=0), 4),
         "recall":    round(recall_score(y_true, y_pred, average='weighted', zero_division=0), 4),
         "f1_score":  round(f1_score(y_true, y_pred, average='weighted', zero_division=0), 4),
     }
-    return metrics
 
-# Generate and Save Confusion Matrix Plot
+
 def plot_confusion_matrix(y_true, y_pred, save_path):
-    cm = confusion_matrix(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred, labels=CLASS_NAMES)
 
     plt.figure(figsize=(12, 10))
     sns.heatmap(
-        cm,
-        annot=True,
-        fmt='d',
-        cmap='Blues',
-        xticklabels=CLASS_NAMES,
-        yticklabels=CLASS_NAMES
+        cm, annot=True, fmt='d', cmap='Blues',
+        xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES
     )
     plt.title("Confusion Matrix", fontsize=16)
     plt.ylabel("Actual", fontsize=12)
@@ -59,76 +93,25 @@ def plot_confusion_matrix(y_true, y_pred, save_path):
     plt.close()
     print(f" Confusion Matrix saved → {save_path}")
 
-# Save Metrics to JSON File
+
 def save_metrics(metrics, save_path):
     with open(save_path, 'w') as f:
         json.dump(metrics, f, indent=4)
     print(f" Metrics saved → {save_path}")
 
 
-# Run the Real Trained Model on the Real Test Set
-def get_real_predictions():
-    """
-    Loads the trained checkpoint (config.BEST_MODEL_PATH) and runs it over
-    every image in config.TEST_DIR, returning true/predicted label indices.
-    Replaces the old dummy-data placeholder with real inference.
-    """
-    if not os.path.exists(config.BEST_MODEL_PATH):
-        raise FileNotFoundError(
-            f"No trained model found at {config.BEST_MODEL_PATH}. "
-            f"Train the CV model first (src/trainer.py or trainer_mlflow.py)."
-        )
-    if not os.path.isdir(config.TEST_DIR):
-        raise FileNotFoundError(
-            f"Test directory not found at {config.TEST_DIR}. "
-            f"Expected an ImageFolder-style structure with one subfolder per class."
-        )
-
-    device = config.DEVICE
-    model = SkinLesionClassifier()
-    state_dict = torch.load(config.BEST_MODEL_PATH, map_location=device)
-    model.load_state_dict(state_dict)
-    model.to(device)
-    model.eval()
-
-    class_to_idx = {name: idx for idx, name in enumerate(CLASS_NAMES)}
-
-    y_true, y_pred = [], []
-    total = 0
-    with torch.no_grad():
-        for true_class in sorted(os.listdir(config.TEST_DIR)):
-            class_folder = os.path.join(config.TEST_DIR, true_class)
-            if not os.path.isdir(class_folder) or true_class not in class_to_idx:
-                continue
-            true_idx = class_to_idx[true_class]
-
-            for filename in os.listdir(class_folder):
-                image_path = os.path.join(class_folder, filename)
-                try:
-                    img = Image.open(image_path).convert("RGB")
-                    input_tensor = test_transform(img).unsqueeze(0).to(device)
-                    logits = model(input_tensor)
-                    pred_idx = logits.argmax(dim=1).item()
-                except Exception as e:
-                    print(f"Skipped {image_path}: {e}")
-                    continue
-
-                y_true.append(true_idx)
-                y_pred.append(pred_idx)
-                total += 1
-                if total % 200 == 0:
-                    print(f"  Evaluated {total} images so far...")
-
-    print(f"Finished evaluating {total} real test images.")
-    return np.array(y_true), np.array(y_pred)
-
-# Main Execution: Evaluation Pipeline
 if __name__ == "__main__":
 
-    # Run the real trained model on the real test set (no more dummy data)
-    y_true, y_pred = get_real_predictions()
+    
+    val_df = pd.read_csv(VAL_CSV_PATH)
+    
+    predictor = FusionPredictor(FUSION_MODEL_PATH)
 
-    # Calculate Performance Metrics
+    y_true, y_pred = run_predictions(val_df, predictor)
+
+    if len(y_true) == 0:
+        raise RuntimeError("No sample has been predicted successfully — check the pipelines.")
+
     metrics = compute_metrics(y_true, y_pred)
 
     print("\n Evaluation Results:")
@@ -137,19 +120,18 @@ if __name__ == "__main__":
     print(f"  Recall    : {metrics['recall']    * 100:.2f}%")
     print(f"  F1 Score  : {metrics['f1_score']  * 100:.2f}%")
 
-    # Save Metrics File
     os.makedirs("outputs", exist_ok=True)
     save_metrics(metrics, "outputs/metrics.json")
-
-   # Generate Visualization
     plot_confusion_matrix(y_true, y_pred, "outputs/confusion_matrix.png")
-    # ─── MLflow ───
-    mlflow.set_experiment("Skin Condition Detection")
-    with mlflow.start_run(run_name="Evaluation Run"):
-        mlflow.log_metric("accuracy",  metrics["accuracy"])
-        mlflow.log_metric("precision", metrics["precision"])
-        mlflow.log_metric("recall",    metrics["recall"])
-        mlflow.log_metric("f1_score",  metrics["f1_score"])
-        mlflow.log_artifact("outputs/confusion_matrix.png")
-        mlflow.log_artifact("outputs/metrics.json")
-        print("\n MLflow run logged successfully!")
+
+#  MLflow 
+mlflow.set_tracking_uri("sqlite:///mlflow.db") 
+mlflow.set_experiment("Skin Condition Detection")
+
+with mlflow.start_run(run_name="Evaluation Run - Real Data"):
+    mlflow.log_metrics(metrics) 
+    mlflow.log_artifact("outputs/confusion_matrix.png")
+    mlflow.log_artifact("outputs/metrics.json")
+    print("\n MLflow run logged successfully!")
+    
+    
